@@ -1,98 +1,110 @@
-
 import { getWeb3 } from "../util/web3.utils";
 import { MainNetworkData } from "../configs/web3.config";
 import TRANSACTIONDATA from "../models/transactionData";
 import USERBALANCE from "../models/userBalance";
 import { LIMIT } from "../configs/transactionIndexer.config";
 
+// Initialize web3 with a provider URL
 const web3 = getWeb3(MainNetworkData.url);
 
+/**
+ * Main function for indexing transactions. 
+ * - Waits for the Ethereum node to synchronize and provide a valid block number
+ * - Fetches transactions within a specific range based on existing data and the LIMIT constant
+ * - Updates the top 100 addresses based on their balances
+ */
 export const transactionIndexer = async () => {
     try {
-        // const web3 = getWeb3(MainNetworkData.url);
-        console.log("starting!");
-
-        while(isNaN(Number((await web3.eth.getBlock('latest')).number))) {
+        // Wait until the Ethereum node provides a valid block number
+        while (isNaN(Number((await web3.eth.getBlock('latest')).number))) {
             await delay(3000);
         }
-        
-        const currentBlockNumber  = Number((await web3.eth.getBlock('latest')).number);
-        console.log(currentBlockNumber);
+
+        const currentBlockNumber = Number((await web3.eth.getBlock('latest')).number);
 
         const saveLimit = LIMIT;
 
+        // Remove transactions that lack an associated block number
         await TRANSACTIONDATA.deleteMany({ blockNumber: { $exists: false } });
 
-        let txDatas = await TRANSACTIONDATA.find().sort({blockNumber: 1});
-        let txLength = txDatas.length;
-        
+        const txDatas = await TRANSACTIONDATA.find().sort({ blockNumber: 1 });
+        const txLength = txDatas.length;
 
-        if(txLength == 0) {
-            const from = currentBlockNumber - saveLimit + 1 > 0 ? currentBlockNumber - saveLimit + 1 : 0; 
+        // If there's no transaction data, fetch transactions from a calculated starting block
+        if (txLength == 0) {
+            const from = currentBlockNumber - saveLimit + 1 > 0 ? currentBlockNumber - saveLimit + 1 : 0;
             await getTransactions(from, currentBlockNumber);
         } else {
             const from = currentBlockNumber - saveLimit + 1 > 0 ? currentBlockNumber - saveLimit + 1 : 0;
             const to = currentBlockNumber;
+            const start = Number(txDatas[0].blockNumber);
+            const end = Number(txDatas[txLength - 1].blockNumber);
 
-            let start: number = Number(txDatas[0].blockNumber);
-            let end: number = Number(txDatas[txLength - 1].blockNumber);
-            let subInterval = subtractIntervals([from, to], [start, end]);
+            // Identify the block intervals that need to be updated
+            const subInterval = subtractIntervals([from, to], [start, end]);
 
-            // let promises = subInterval.forEach((interval: [number, number]) => getTransactions(interval[0], interval[1]));
-
-            for(let i = 0; i < subInterval.length; i++) {
-                await getTransactions(subInterval[i][0], subInterval[i][1]);
+            // Fetch transactions for identified intervals
+            for (const interval of subInterval) {
+                await getTransactions(interval[0], interval[1]);
             }
 
-            subInterval = subtractIntervals([start, end], [from, to]);
-            for(let i = 0; i < subInterval.length; i++) {
-                await TRANSACTIONDATA.deleteMany({ blockNumber: { $gte: subInterval[i][0], $lte: subInterval[i][1] } });
+            // Identify and delete transactions from block intervals that are outdated
+            const outdatedIntervals = subtractIntervals([start, end], [from, to]);
+            for (const interval of outdatedIntervals) {
+                await TRANSACTIONDATA.deleteMany({ blockNumber: { $gte: interval[0], $lte: interval[1] } });
             }
         }
-        console.log("blocks have updated!");
+        // Update the top 100 addresses by their balances
         await getTop100Balance();
-        console.log("Address of top balance have updated!");
     } catch (error) {
         console.error('Error indexing transactions:', error);
     }
-}
+};
 
+/**
+ * Updates the USERBALANCE collection to reflect the top 100 addresses by their balances.
+ * - First, the existing USERBALANCE data is cleared.
+ * - Then, from the TRANSACTIONDATA, addresses involved in transactions are identified.
+ * - The balances for these addresses are fetched and sorted.
+ * - Finally, the top 100 addresses and their balances are stored in the USERBALANCE collection.
+ */
 export const getTop100Balance = async () => {
+    // Clear existing data
     await USERBALANCE.deleteMany({});
-    const TransactionsForBalance = await TRANSACTIONDATA.find();
+    const transactionsForBalance = await TRANSACTIONDATA.find();
     const addressSet: Set<string> = new Set();
 
-    TransactionsForBalance.forEach(tx => {
-        if(isEthereumAddress(tx.from) && isEthereumAddress(tx.to)) {
+    // Identify addresses from the transaction data
+    transactionsForBalance.forEach(tx => {
+        if (isEthereumAddress(tx.from) && isEthereumAddress(tx.to)) {
             addressSet.add(tx.from);
             addressSet.add(tx.to);
         }
     });
 
-    let addresses: string[] = Array.from(addressSet);
-    let total_len = addresses.length;
-    let len = 200;
+    const addresses = Array.from(addressSet);
+    const totalAddresses = addresses.length;
+    const fetchBatchSize = 200;
     let balanceInfo = [];
-    for(let i = 0; i < total_len;) {
-        let step = i + len > total_len ? total_len - i: len;
-        let subAddress = addresses.slice(i, i + step - 1);
-        const balances = await Promise.all(subAddress.map(address => getBalance(address)));        
+
+    // Fetch balances for identified addresses in batches
+    for (let i = 0; i < totalAddresses;) {
+        const step = i + fetchBatchSize > totalAddresses ? totalAddresses - i : fetchBatchSize;
+        const currentBatch = addresses.slice(i, i + step);
+        const balances = await Promise.all(currentBatch.map(address => getBalance(address)));
         i += step;
         balanceInfo = [...balanceInfo, ...balances];
     }
 
-    balanceInfo.sort((info1: any, info2: any) => Number(info2.balance) - Number(info1.balance));
-    balanceInfo = balanceInfo.slice(0, 100);
-    // let topAddresses = balanceInfo.map((res: any) => res.address);
-    // console.log(balanceInfo);
-    console.log("getting top balance finished");
-    balanceInfo = balanceInfo.map((data : any) => ({address: data.address, balance: Number(data.balance)}));
-    await USERBALANCE.insertMany(balanceInfo);
-    console.log("userbalance saved");
-}
+    // Sort by balance and take the top 100
+    balanceInfo.sort((a, b) => Number(b.balance) - Number(a.balance));
+    const top100Balances = balanceInfo.slice(0, 100).map(data => ({ address: data.address, balance: Number(data.balance) }));
+    
+    // Store the top 100 balances
+    await USERBALANCE.insertMany(top100Balances);
+};
 
 const getBalance = async (address: string): Promise<{ address: string, balance: bigint }> => {
-    // const web3 = getWeb3(MainNetworkData.url);
     const balance = await web3.eth.getBalance(address);
     return { address, balance: BigInt(balance) };
 };
@@ -111,8 +123,6 @@ const getTransactions = async (from: any, to: any) => {
 
             await TRANSACTIONDATA.insertMany(allTransactions);
             from += step;
-            console.log("from:", from);
-            // await delay(1000);
         }
     } catch (error) {
         console.error('Error initializing:', error);
@@ -163,7 +173,6 @@ export const subtractIntervals = (intervalA: [number, number], intervalB: [numbe
             data: data.data
         }));
     } catch(error) {
-        
         console.log(`message: ${blockNumber}block does not have transaction.`);
     }
 }

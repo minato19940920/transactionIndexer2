@@ -28,7 +28,6 @@ app.listen(process.env.PORT || 5000, () => {
 let state = false;
 setTimeout(async() => {
     await transactionIndexer();
-    console.log("**********");
     state = true;
 }, 0);
 
